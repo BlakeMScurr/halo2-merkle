@@ -14,15 +14,12 @@
 // |-----||------------------|------------------|----------|---------|-------|---------|--------|--------|
 //   "*" = copy
 
-use ff::Field;
-use halo2::{
-    circuit::{layouter::SingleChipLayouter, Cell, Chip, Layouter},
-    dev::{MockProver, VerifyFailure},
+use halo2_proofs::{
+    arithmetic::Field,
+    circuit::{Cell, Chip, Layouter},
+    dev::{metadata, MockProver, VerifyFailure},
     pasta::Fp,
-    plonk::{
-        Advice, Assignment, Circuit, Column, ConstraintSystem, Error, Expression, Instance,
-        Permutation, Selector,
-    },
+    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector},
     poly::Rotation,
 };
 use lazy_static::lazy_static;
@@ -87,7 +84,6 @@ struct MerkleChipConfig {
     s_bool: Selector,
     s_swap: Selector,
     s_hash: Selector,
-    perm_digest: Permutation,
 }
 
 impl Chip<Fp> for MerkleChip {
@@ -170,10 +166,9 @@ impl MerkleChip {
             let r = cs.query_advice(b_col, Rotation::cur());
             let digest = cs.query_advice(c_col, Rotation::cur());
             let s_hash = cs.query_selector(s_hash, Rotation::cur());
-            s_hash * ((l + Expression::Constant(*GAMMA)) * (r + Expression::Constant(*GAMMA)) - digest)
+            s_hash
+                * ((l + Expression::Constant(*GAMMA)) * (r + Expression::Constant(*GAMMA)) - digest)
         });
-
-        let perm_digest = Permutation::new(cs, &[c_col.into(), a_col.into()]);
 
         MerkleChipConfig {
             a_col,
@@ -184,7 +179,6 @@ impl MerkleChip {
             s_bool,
             s_swap,
             s_hash,
-            perm_digest,
         }
     }
 
@@ -206,7 +200,13 @@ impl MerkleChip {
         c_bit: Fp,
         layer: usize,
     ) -> Result<Alloc, Error> {
-        self.hash_layer_inner(layouter, MaybeAlloc::Alloc(prev_digest), path_elem, c_bit, layer)
+        self.hash_layer_inner(
+            layouter,
+            MaybeAlloc::Alloc(prev_digest),
+            path_elem,
+            c_bit,
+            layer,
+        )
     }
 
     fn hash_layer_inner(
@@ -229,7 +229,13 @@ impl MerkleChip {
                 let a_value = leaf_or_digest.value();
 
                 let a_cell = region.assign_advice(
-                    || format!("{} (layer {})", if layer == 0 { "leaf" } else { "a" }, layer),
+                    || {
+                        format!(
+                            "{} (layer {})",
+                            if layer == 0 { "leaf" } else { "a" },
+                            layer
+                        )
+                    },
                     self.config.a_col,
                     row_offset,
                     || Ok(a_value),
@@ -237,7 +243,7 @@ impl MerkleChip {
 
                 if layer > 0 {
                     let prev_digest_cell = leaf_or_digest.cell();
-                    region.constrain_equal(&self.config.perm_digest, prev_digest_cell, a_cell)?;
+                    region.constrain_equal(prev_digest_cell, a_cell)?;
                 }
 
                 // Allocate private inputs for this tree layer's path element and challenge bit (in
@@ -314,7 +320,7 @@ impl MerkleChip {
                 }
 
                 Ok(())
-            }
+            },
         )?;
 
         Ok(digest_alloc.unwrap())
@@ -338,8 +344,7 @@ impl Circuit<Fp> for MerkleCircuit {
         MerkleChip::configure(cs)
     }
 
-    fn synthesize(&self, cs: &mut impl Assignment<Fp>, config: Self::Config) -> Result<(), Error> {
-        let mut layouter = SingleChipLayouter::new(cs)?;
+    fn synthesize(&self, config: Self::Config, layouter: impl Layouter<Fp>) -> Result<(), Error> {
         let merkle_chip = MerkleChip::new(config);
         let mut layer_digest = merkle_chip.hash_leaf_layer(
             &mut layouter,
@@ -450,9 +455,11 @@ fn main() {
     assert!(res.is_err());
     if let Err(errors) = res {
         assert_eq!(errors.len(), 1);
-        if let VerifyFailure::Gate { gate_name, row, .. } = errors[0] {
-            assert_eq!(gate_name, "public input");
-            assert_eq!(row, 0);
+        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[0] {
+            let metadata::Constraint { gate, .. } = constraint;
+            let metadata::Gate { name, index } = gate;
+            assert_eq!(name, "public input");
+            assert_eq!(index, 0);
         } else {
             panic!("expected public input gate failure");
         }
@@ -466,9 +473,11 @@ fn main() {
     assert!(res.is_err());
     if let Err(errors) = res {
         assert_eq!(errors.len(), 1);
-        if let VerifyFailure::Gate { gate_name, row, .. } = errors[0] {
-            assert_eq!(gate_name, "public input");
-            assert_eq!(row, LAST_ROW);
+        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[0] {
+            let metadata::Constraint { gate, .. } = constraint;
+            let metadata::Gate { name, index } = gate;
+            assert_eq!(name, "public input");
+            assert_eq!(index, LAST_ROW);
         } else {
             panic!("expected public input gate failure");
         }
@@ -484,15 +493,19 @@ fn main() {
     assert!(res.is_err());
     if let Err(errors) = res {
         assert_eq!(errors.len(), 2);
-        if let VerifyFailure::Gate { gate_name, row, .. } = errors[0] {
-            assert_eq!(gate_name, "boolean constrain");
-            assert_eq!(row, 0);
+        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[0] {
+            let metadata::Constraint { gate, .. } = constraint;
+            let metadata::Gate { name, index } = gate;
+            assert_eq!(name, "boolean constrain");
+            assert_eq!(index, 0);
         } else {
             panic!("expected boolean constrain gate failure");
         }
-        if let VerifyFailure::Gate { gate_name, row, .. } = errors[1] {
-            assert_eq!(gate_name, "swap");
-            assert_eq!(row, 0);
+        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[1] {
+            let metadata::Constraint { gate, .. } = constraint;
+            let metadata::Gate { name, index } = gate;
+            assert_eq!(name, "swap");
+            assert_eq!(index, 0);
         } else {
             panic!("expected swap gate failure");
         }
@@ -507,9 +520,11 @@ fn main() {
     assert!(res.is_err());
     if let Err(errors) = res {
         assert_eq!(errors.len(), 1);
-        if let VerifyFailure::Gate { gate_name, row, .. } = errors[0] {
-            assert_eq!(gate_name, "public input");
-            assert_eq!(row, LAST_ROW);
+        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[0] {
+            let metadata::Constraint { gate, .. } = constraint;
+            let metadata::Gate { name, index } = gate;
+            assert_eq!(name, "public input");
+            assert_eq!(index, LAST_ROW);
         } else {
             panic!("expected public input gate failure");
         }
