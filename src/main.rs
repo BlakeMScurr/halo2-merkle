@@ -435,6 +435,19 @@ impl Tree {
     }
 }
 
+// constraint not satisfied
+fn cns(gate_name: &'static str, row: usize) -> VerifyFailure {
+    VerifyFailure::ConstraintNotSatisfied {
+        constraint: ((0, gate_name).into(), 0, "").into(),
+        location: FailureLocation::OutsideRegion { row },
+        // No idea what this is (or most of this stuff lmao)
+        cell_values: vec![(
+            ((Any::Advice, 0).into(), 0).into(),
+            "what is this supposed to be?".to_string(),
+        )],
+    }
+}
+
 fn main() {
     assert!(N_LEAFS.is_power_of_two());
 
@@ -450,6 +463,7 @@ fn main() {
             } else {
                 Fp::one()
             }
+            // Fp::from(c >> i == 0) // TODO: succinctness (once tests pass)
         })
         .collect();
 
@@ -458,13 +472,13 @@ fn main() {
     let k = (N_ROWS_USED as f32).log2().ceil() as u32;
     let mut pub_inputs = vec![Fp::zero(); 1 << k];
     for i in 0..PATH_LEN {
-        pub_inputs[2 * i] = c_bits[i].clone();
+        pub_inputs[2 * i] = c_bits[i];
     }
     pub_inputs[LAST_ROW] = tree.root();
 
     // Assert that the constraint system is satisfied for a witness corresponding to `pub_inputs`.
     let circuit = MerkleCircuit {
-        leaf: Some(tree.leafs()[c].clone()),
+        leaf: Some(tree.leafs()[c]),
         path: Some(tree.gen_path(c)),
         c_bits: Some(c_bits),
     };
@@ -473,43 +487,20 @@ fn main() {
 
     // Assert that changing the public challenge causes the constraint system to become unsatisfied.
     let mut bad_pub_inputs = pub_inputs.clone();
+    // = Fp::from(pub_input[0] == Fp::zero()); // TODO: rewrite once tests run
     bad_pub_inputs[0] = if pub_inputs[0] == Fp::zero() {
         Fp::one()
     } else {
         Fp::zero()
     };
     let prover = MockProver::run(k, &circuit, vec![bad_pub_inputs]).unwrap();
-    let res = prover.verify();
-    assert!(res.is_err());
-    if let Err(errors) = res {
-        assert_eq!(errors.len(), 1);
-        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[0] {
-            let metadata::Constraint { gate, .. } = constraint;
-            let metadata::Gate { name, index } = gate;
-            assert_eq!(name, "public input");
-            assert_eq!(index, 0);
-        } else {
-            panic!("expected public input gate failure");
-        }
-    }
+    assert_eq!(prover.verify(), Err(vec![cns("public input", 0)]));
 
     // Assert that changing the public root causes the constraint system to become unsatisfied.
     let mut bad_pub_inputs = pub_inputs.clone();
     bad_pub_inputs[LAST_ROW] += Fp::one();
     let prover = MockProver::run(k, &circuit, vec![bad_pub_inputs]).unwrap();
-    let res = prover.verify();
-    assert!(res.is_err());
-    if let Err(errors) = res {
-        assert_eq!(errors.len(), 1);
-        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[0] {
-            let metadata::Constraint { gate, .. } = constraint;
-            let metadata::Gate { name, index } = gate;
-            assert_eq!(name, "public input");
-            assert_eq!(index, LAST_ROW);
-        } else {
-            panic!("expected public input gate failure");
-        }
-    }
+    assert_eq!(prover.verify(), Err(vec![cns("public input", LAST_ROW)]));
 
     // Assert that a non-boolean challenge bit causes the boolean constrain and swap gates to fail.
     let mut bad_pub_inputs = pub_inputs.clone();
@@ -517,44 +508,15 @@ fn main() {
     let mut bad_circuit = circuit.clone();
     bad_circuit.c_bits.as_mut().unwrap()[0] = Fp::from(2);
     let prover = MockProver::run(k, &bad_circuit, vec![bad_pub_inputs]).unwrap();
-    let res = prover.verify();
-    assert!(res.is_err());
-    if let Err(errors) = res {
-        assert_eq!(errors.len(), 2);
-        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[0] {
-            let metadata::Constraint { gate, .. } = constraint;
-            let metadata::Gate { name, index } = gate;
-            assert_eq!(name, "boolean constrain");
-            assert_eq!(index, 0);
-        } else {
-            panic!("expected boolean constrain gate failure");
-        }
-        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[1] {
-            let metadata::Constraint { gate, .. } = constraint;
-            let metadata::Gate { name, index } = gate;
-            assert_eq!(name, "swap");
-            assert_eq!(index, 0);
-        } else {
-            panic!("expected swap gate failure");
-        }
-    }
+    assert_eq!(
+        prover.verify(),
+        Err(vec![cns("boolean constrain", 0), cns("swap", 0)])
+    );
 
     // Assert that changing the witnessed path causes the constraint system to become unsatisfied
     // when checking that the calculated root is equal to the public input root.
     let mut bad_circuit = circuit.clone();
     bad_circuit.path.as_mut().unwrap()[0] += Fp::one();
     let prover = MockProver::run(k, &bad_circuit, vec![pub_inputs.clone()]).unwrap();
-    let res = prover.verify();
-    assert!(res.is_err());
-    if let Err(errors) = res {
-        assert_eq!(errors.len(), 1);
-        if let VerifyFailure::ConstraintNotSatisfied { constraint, .. } = errors[0] {
-            let metadata::Constraint { gate, .. } = constraint;
-            let metadata::Gate { name, index } = gate;
-            assert_eq!(name, "public input");
-            assert_eq!(index, LAST_ROW);
-        } else {
-            panic!("expected public input gate failure");
-        }
-    }
+    assert_eq!(prover.verify(), Err(vec![cns("public input", LAST_ROW)]));
 }
