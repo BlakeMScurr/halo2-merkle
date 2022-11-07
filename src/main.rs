@@ -17,11 +17,9 @@
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{Cell, Chip, Layouter, SimpleFloorPlanner, Value},
-    dev::{metadata, FailureLocation, MockProver, VerifyFailure},
+    dev::{FailureLocation, MockProver, VerifyFailure},
     pasta::Fp,
-    plonk::{
-        Advice, Any, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector,
-    },
+    plonk::{Advice, Any, Circuit, Column, ConstraintSystem, Error, Expression, Selector},
     poly::Rotation,
 };
 use lazy_static::lazy_static;
@@ -81,7 +79,6 @@ struct MerkleChipConfig {
     a_col: Column<Advice>,
     b_col: Column<Advice>,
     c_col: Column<Advice>,
-    pub_col: Column<Instance>,
     s_pub: Selector,
     s_bool: Selector,
     s_swap: Selector,
@@ -177,7 +174,6 @@ impl MerkleChip {
             a_col,
             b_col,
             c_col,
-            pub_col,
             s_pub,
             s_bool,
             s_swap,
@@ -242,9 +238,7 @@ impl MerkleChip {
                         },
                         self.config.a_col,
                         row_offset,
-                        || Value {
-                            inner: Some(a_value),
-                        },
+                        || Value::known(a_value),
                     )?
                     .cell();
 
@@ -260,16 +254,14 @@ impl MerkleChip {
                     || format!("path elem (layer {})", layer),
                     self.config.b_col,
                     row_offset,
-                    || Value {
-                        inner: Some(path_elem),
-                    },
+                    || Value::known(path_elem),
                 )?;
 
                 let _c_bit_cell = region.assign_advice(
                     || format!("challenge bit (layer {})", layer),
                     self.config.c_col,
                     row_offset,
-                    || Value { inner: Some(c_bit) },
+                    || Value::known(c_bit),
                 )?;
 
                 // Expose the challenge bit as a public input.
@@ -296,18 +288,14 @@ impl MerkleChip {
                     || format!("preimg_l (layer {})", layer),
                     self.config.a_col,
                     row_offset,
-                    || Value {
-                        inner: Some(preimg_l_value),
-                    },
+                    || Value::known(preimg_l_value),
                 )?;
 
                 let _preimg_r_cell = region.assign_advice(
                     || format!("preimage right (layer {})", layer),
                     self.config.b_col,
                     row_offset,
-                    || Value {
-                        inner: Some(preimg_r_value),
-                    },
+                    || Value::known(preimg_r_value),
                 )?;
 
                 let digest_value = mock_hash(preimg_l_value, preimg_r_value);
@@ -316,9 +304,7 @@ impl MerkleChip {
                     || format!("digest (layer {})", layer),
                     self.config.c_col,
                     row_offset,
-                    || Value {
-                        inner: Some(digest_value),
-                    },
+                    || Value::known(digest_value),
                 )?;
 
                 digest_alloc = Some(Alloc {
