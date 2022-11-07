@@ -16,10 +16,12 @@
 
 use halo2_proofs::{
     arithmetic::Field,
-    circuit::{Cell, Chip, Layouter},
-    dev::{metadata, MockProver, VerifyFailure},
+    circuit::{Cell, Chip, Layouter, SimpleFloorPlanner, Value},
+    dev::{metadata, FailureLocation, MockProver, VerifyFailure},
     pasta::Fp,
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector},
+    plonk::{
+        Advice, Any, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector,
+    },
     poly::Rotation,
 };
 use lazy_static::lazy_static;
@@ -118,14 +120,14 @@ impl MerkleChip {
         cs.create_gate("public input", |cs| {
             let c = cs.query_advice(c_col, Rotation::cur());
             let pi = cs.query_instance(pub_col, Rotation::cur());
-            let s_pub = cs.query_selector(s_pub, Rotation::cur());
-            s_pub * (c - pi)
+            let s_pub = cs.query_selector(s_pub);
+            [s_pub * (c - pi)]
         });
 
         cs.create_gate("boolean constrain", |cs| {
             let c = cs.query_advice(c_col, Rotation::cur());
-            let s_bool = cs.query_selector(s_bool, Rotation::cur());
-            s_bool * c.clone() * (Expression::Constant(Fp::one()) - c)
+            let s_bool = cs.query_selector(s_bool);
+            [s_bool * c.clone() * (Expression::Constant(Fp::one()) - c)]
         });
 
         // |-------|-------|-------|--------|
@@ -154,10 +156,10 @@ impl MerkleChip {
             let a = cs.query_advice(a_col, Rotation::cur());
             let b = cs.query_advice(b_col, Rotation::cur());
             let bit = cs.query_advice(c_col, Rotation::cur());
-            let s_swap = cs.query_selector(s_swap, Rotation::cur());
+            let s_swap = cs.query_selector(s_swap);
             let l = cs.query_advice(a_col, Rotation::next());
             let r = cs.query_advice(b_col, Rotation::next());
-            s_swap * ((bit * Fp::from(2) * (b.clone() - a.clone()) - (l - a)) - (b - r))
+            [s_swap * ((bit * Fp::from(2) * (b.clone() - a.clone()) - (l - a)) - (b - r))]
         });
 
         // (l + gamma) * (r + gamma) = digest
@@ -165,9 +167,10 @@ impl MerkleChip {
             let l = cs.query_advice(a_col, Rotation::cur());
             let r = cs.query_advice(b_col, Rotation::cur());
             let digest = cs.query_advice(c_col, Rotation::cur());
-            let s_hash = cs.query_selector(s_hash, Rotation::cur());
-            s_hash
-                * ((l + Expression::Constant(*GAMMA)) * (r + Expression::Constant(*GAMMA)) - digest)
+            let s_hash = cs.query_selector(s_hash);
+            [s_hash
+                * ((l + Expression::Constant(*GAMMA)) * (r + Expression::Constant(*GAMMA))
+                    - digest)]
         });
 
         MerkleChipConfig {
@@ -228,18 +231,22 @@ impl MerkleChip {
                 // calculated digest (stored in the previous row's `c_col`).
                 let a_value = leaf_or_digest.value();
 
-                let a_cell = region.assign_advice(
-                    || {
-                        format!(
-                            "{} (layer {})",
-                            if layer == 0 { "leaf" } else { "a" },
-                            layer
-                        )
-                    },
-                    self.config.a_col,
-                    row_offset,
-                    || Ok(a_value),
-                )?;
+                let a_cell = region
+                    .assign_advice(
+                        || {
+                            format!(
+                                "{} (layer {})",
+                                if layer == 0 { "leaf" } else { "a" },
+                                layer
+                            )
+                        },
+                        self.config.a_col,
+                        row_offset,
+                        || Value {
+                            inner: Some(a_value),
+                        },
+                    )?
+                    .cell();
 
                 if layer > 0 {
                     let prev_digest_cell = leaf_or_digest.cell();
@@ -253,14 +260,16 @@ impl MerkleChip {
                     || format!("path elem (layer {})", layer),
                     self.config.b_col,
                     row_offset,
-                    || Ok(path_elem),
+                    || Value {
+                        inner: Some(path_elem),
+                    },
                 )?;
 
                 let _c_bit_cell = region.assign_advice(
                     || format!("challenge bit (layer {})", layer),
                     self.config.c_col,
                     row_offset,
-                    || Ok(c_bit),
+                    || Value { inner: Some(c_bit) },
                 )?;
 
                 // Expose the challenge bit as a public input.
@@ -287,14 +296,18 @@ impl MerkleChip {
                     || format!("preimg_l (layer {})", layer),
                     self.config.a_col,
                     row_offset,
-                    || Ok(preimg_l_value),
+                    || Value {
+                        inner: Some(preimg_l_value),
+                    },
                 )?;
 
                 let _preimg_r_cell = region.assign_advice(
                     || format!("preimage right (layer {})", layer),
                     self.config.b_col,
                     row_offset,
-                    || Ok(preimg_r_value),
+                    || Value {
+                        inner: Some(preimg_r_value),
+                    },
                 )?;
 
                 let digest_value = mock_hash(preimg_l_value, preimg_r_value);
@@ -303,11 +316,13 @@ impl MerkleChip {
                     || format!("digest (layer {})", layer),
                     self.config.c_col,
                     row_offset,
-                    || Ok(digest_value),
+                    || Value {
+                        inner: Some(digest_value),
+                    },
                 )?;
 
                 digest_alloc = Some(Alloc {
-                    cell: digest_cell,
+                    cell: digest_cell.cell(),
                     value: digest_value,
                 });
 
@@ -339,12 +354,17 @@ struct MerkleCircuit {
 
 impl Circuit<Fp> for MerkleCircuit {
     type Config = MerkleChipConfig;
+    type FloorPlanner = SimpleFloorPlanner;
 
     fn configure(cs: &mut ConstraintSystem<Fp>) -> Self::Config {
         MerkleChip::configure(cs)
     }
 
-    fn synthesize(&self, config: Self::Config, layouter: impl Layouter<Fp>) -> Result<(), Error> {
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<Fp>,
+    ) -> Result<(), Error> {
         let merkle_chip = MerkleChip::new(config);
         let mut layer_digest = merkle_chip.hash_leaf_layer(
             &mut layouter,
@@ -362,6 +382,14 @@ impl Circuit<Fp> for MerkleCircuit {
             )?;
         }
         Ok(())
+    }
+
+    fn without_witnesses(&self) -> Self {
+        Self {
+            leaf: None,
+            path: None,
+            c_bits: None,
+        }
     }
 }
 
