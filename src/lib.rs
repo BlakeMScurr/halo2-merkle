@@ -425,9 +425,9 @@ mod tests {
             let mut node_index = c;
             for layer in 0..path_len {
                 let sib = if node_index & 1 == 0 {
-                    self.0[layer][node_index + 1].clone()
+                    self.0[layer][node_index + 1]
                 } else {
-                    self.0[layer][node_index - 1].clone()
+                    self.0[layer][node_index - 1]
                 };
                 path.push(sib);
                 node_index /= 2;
