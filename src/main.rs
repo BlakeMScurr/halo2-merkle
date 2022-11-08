@@ -47,14 +47,14 @@ enum MaybeAlloc {
 impl MaybeAlloc {
     fn value(&self) -> Fp {
         match self {
-            MaybeAlloc::Alloc(alloc) => alloc.value.clone(),
-            MaybeAlloc::Unalloc(value) => value.clone(),
+            MaybeAlloc::Alloc(alloc) => alloc.value,
+            MaybeAlloc::Unalloc(value) => *value,
         }
     }
 
     fn cell(&self) -> Cell {
         match self {
-            MaybeAlloc::Alloc(alloc) => alloc.cell.clone(),
+            MaybeAlloc::Alloc(alloc) => alloc.cell,
             MaybeAlloc::Unalloc(_) => unreachable!(),
         }
     }
@@ -328,18 +328,21 @@ impl MerkleChip {
             },
         )?;
 
-        Ok(digest_alloc.unwrap())
+        match digest_alloc {
+            None => Err(Error::Synthesis),
+            Some(inner) => Ok(inner),
+        }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct MerkleCircuit {
     // Private inputs.
-    leaf: Option<Fp>,
-    path: Option<Vec<Fp>>,
+    leaf: Fp,
+    path: Vec<Fp>,
     // Public inputs (from the prover). The root is also a public input, but it is calculated within
     // the circuit.
-    c_bits: Option<Vec<Fp>>,
+    c_bits: Vec<Fp>,
 }
 
 impl Circuit<Fp> for MerkleCircuit {
@@ -355,21 +358,21 @@ impl Circuit<Fp> for MerkleCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<Fp>,
     ) -> Result<(), Error> {
-        let path_len = self.path.as_ref().unwrap().len();
+        let path_len = self.path.len();
         let merkle_chip = MerkleChip::new(config);
         let mut layer_digest = merkle_chip.hash_leaf_layer(
             &mut layouter,
-            *self.leaf.as_ref().unwrap(),
-            self.path.as_ref().unwrap()[0],
-            self.c_bits.as_ref().unwrap()[0],
+            self.leaf,
+            self.path[0],
+            self.c_bits[0],
             path_len,
         )?;
         for layer in 1..path_len {
             layer_digest = merkle_chip.hash_non_leaf_layer(
                 &mut layouter,
                 layer_digest,
-                self.path.as_ref().unwrap()[layer],
-                self.c_bits.as_ref().unwrap()[layer],
+                self.path[layer],
+                self.c_bits[layer],
                 layer,
                 path_len,
             )?;
@@ -378,11 +381,7 @@ impl Circuit<Fp> for MerkleCircuit {
     }
 
     fn without_witnesses(&self) -> Self {
-        Self {
-            leaf: None,
-            path: None,
-            c_bits: None,
-        }
+        Self::default()
     }
 }
 
@@ -488,9 +487,9 @@ mod tests {
 
         // Assert that the constraint system is satisfied for a witness corresponding to `pub_inputs`.
         let circuit = MerkleCircuit {
-            leaf: Some(tree.leafs()[c]),
-            path: Some(tree.gen_path(c, path_len)),
-            c_bits: Some(c_bits.clone()),
+            leaf: tree.leafs()[c],
+            path: tree.gen_path(c, path_len),
+            c_bits: c_bits.clone(),
         };
         TestSetup {
             k,
@@ -519,7 +518,7 @@ mod tests {
     #[test]
     fn basic_test_works() {
         let s = setup_test();
-        let prover = MockProver::run(s.k, &s.circuit, vec![s.pub_inputs.clone()]).unwrap();
+        let prover = MockProver::run(s.k, &s.circuit, vec![s.pub_inputs]).unwrap();
         assert!(prover.verify().is_ok());
     }
 
@@ -588,7 +587,7 @@ mod tests {
         let mut bad_pub_inputs = s.pub_inputs.clone();
         bad_pub_inputs[0] = Fp::from(2);
         let mut bad_circuit = s.circuit.clone();
-        bad_circuit.c_bits.as_mut().unwrap()[0] = Fp::from(2);
+        bad_circuit.c_bits[0] = Fp::from(2);
         let prover = MockProver::run(s.k, &bad_circuit, vec![bad_pub_inputs]).unwrap();
 
         let (first, second) = if s.c & 1 == 0 {
@@ -632,12 +631,9 @@ mod tests {
         // Assert that changing the witnessed path causes the constraint system to become unsatisfied
         // when checking that the calculated root is equal to the public input root.
         let mut bad_circuit = s.circuit;
-        bad_circuit.path.as_mut().unwrap()[0] += Fp::one();
-        let bad_root = Tree::calculate_root(
-            bad_circuit.clone().leaf.unwrap(),
-            bad_circuit.clone().path.unwrap(),
-            s.c_bits,
-        );
+        bad_circuit.path[0] += Fp::one();
+        let bad_root =
+            Tree::calculate_root(bad_circuit.clone().leaf, bad_circuit.clone().path, s.c_bits);
 
         let prover = MockProver::run(s.k, &bad_circuit, vec![s.pub_inputs.clone()]).unwrap();
         assert_eq!(
