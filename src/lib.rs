@@ -34,9 +34,9 @@ fn mock_hash(a: Fp, b: Fp) -> Fp {
     (a + *GAMMA) * (b + *GAMMA)
 }
 
-struct LayerDigest {
-    cell: Cell,
+struct SpineElement {
     value: Fp,
+    cell: Option<Cell>, // If the last element in the path spine was calculated as a digest in another cell, it's put here
 }
 
 struct MerkleChip {
@@ -160,41 +160,41 @@ impl MerkleChip {
         path_elem: Fp,
         c_bit: Fp,
         path_len: usize,
-    ) -> Result<LayerDigest, Error> {
-        self.hash_layer_inner(layouter, leaf, None, path_elem, c_bit, 0, path_len)
+    ) -> Result<SpineElement, Error> {
+        self.hash_layer_inner(
+            layouter,
+            SpineElement {
+                value: leaf,
+                cell: None,
+            },
+            path_elem,
+            c_bit,
+            0,
+            path_len,
+        )
     }
 
     fn hash_non_leaf_layer(
         &self,
         layouter: &mut impl Layouter<Fp>,
-        prev_digest: Fp,
-        prev_digest_cell: Cell,
+        prev_digest: SpineElement,
         path_elem: Fp,
         c_bit: Fp,
         layer: usize,
         path_len: usize,
-    ) -> Result<LayerDigest, Error> {
-        self.hash_layer_inner(
-            layouter,
-            prev_digest,
-            Some(prev_digest_cell),
-            path_elem,
-            c_bit,
-            layer,
-            path_len,
-        )
+    ) -> Result<SpineElement, Error> {
+        self.hash_layer_inner(layouter, prev_digest, path_elem, c_bit, layer, path_len)
     }
 
     fn hash_layer_inner(
         &self,
         layouter: &mut impl Layouter<Fp>,
-        a_value: Fp,
-        prev_digest_cell: Option<Cell>,
+        prev_digest: SpineElement,
         path_elem: Fp,
         c_bit: Fp,
         layer: usize,
         path_len: usize,
-    ) -> Result<LayerDigest, Error> {
+    ) -> Result<SpineElement, Error> {
         layouter.assign_region(
             || "leaf layer",
             |mut region| {
@@ -202,6 +202,7 @@ impl MerkleChip {
 
                 // Allocate in `a_col` either the leaf or reallocate the previous tree layer's
                 // calculated digest (stored in the previous row's `c_col`).
+                let a_value = prev_digest.value;
 
                 let a_cell = region
                     .assign_advice(
@@ -218,8 +219,12 @@ impl MerkleChip {
                     )?
                     .cell();
 
+                if (layer == 0) != (prev_digest.cell.is_none()) {
+                    // We should have a previous cell containing the last digest iff layer > 0 (TODO: test)
+                    return Err(Error::Synthesis);
+                }
                 if layer > 0 {
-                    region.constrain_equal(prev_digest_cell.unwrap(), a_cell)?;
+                    region.constrain_equal(prev_digest.cell.unwrap(), a_cell)?;
                 }
 
                 // Allocate private inputs for this tree layer's path element and challenge bit (in
@@ -290,8 +295,8 @@ impl MerkleChip {
                     self.config.s_pub.enable(&mut region, row_offset)?;
                 }
 
-                Ok(LayerDigest {
-                    cell: digest_cell.cell(),
+                Ok(SpineElement {
+                    cell: Some(digest_cell.cell()),
                     value: digest_value,
                 })
             },
@@ -334,8 +339,7 @@ impl Circuit<Fp> for MerkleCircuit {
         for layer in 1..path_len {
             layer_digest = merkle_chip.hash_non_leaf_layer(
                 &mut layouter,
-                layer_digest.value,
-                layer_digest.cell,
+                layer_digest,
                 self.path[layer],
                 self.c_bits[layer],
                 layer,
