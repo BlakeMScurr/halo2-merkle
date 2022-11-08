@@ -17,25 +17,13 @@
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{Cell, Chip, Layouter, SimpleFloorPlanner, Value},
-    dev::{metadata, FailureLocation, MockProver, VerifyFailure},
     pasta::Fp,
-    plonk::{
-        Advice, Any, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector,
-    },
+    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Expression, Selector},
     poly::Rotation,
 };
 use lazy_static::lazy_static;
-use rand::{thread_rng, Rng, SeedableRng};
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-
-// The number of leafs in the Merkle tree. This value can be changed to any power of two.
-const N_LEAFS: usize = 512;
-const PATH_LEN: usize = N_LEAFS.trailing_zeros() as usize;
-const TREE_LAYERS: usize = PATH_LEN + 1;
-
-// The number of rows used in the constraint system matrix (two rows per path element).
-const N_ROWS_USED: usize = 2 * PATH_LEN;
-const LAST_ROW: usize = N_ROWS_USED - 1;
 
 lazy_static! {
     static ref GAMMA: Fp = Fp::random(ChaCha8Rng::from_seed([101u8; 32]));
@@ -81,7 +69,6 @@ struct MerkleChipConfig {
     a_col: Column<Advice>,
     b_col: Column<Advice>,
     c_col: Column<Advice>,
-    pub_col: Column<Instance>,
     s_pub: Selector,
     s_bool: Selector,
     s_swap: Selector,
@@ -180,7 +167,6 @@ impl MerkleChip {
             a_col,
             b_col,
             c_col,
-            pub_col,
             s_pub,
             s_bool,
             s_swap,
@@ -194,8 +180,16 @@ impl MerkleChip {
         leaf: Fp,
         path_elem: Fp,
         c_bit: Fp,
+        path_len: usize,
     ) -> Result<Alloc, Error> {
-        self.hash_layer_inner(layouter, MaybeAlloc::Unalloc(leaf), path_elem, c_bit, 0)
+        self.hash_layer_inner(
+            layouter,
+            MaybeAlloc::Unalloc(leaf),
+            path_elem,
+            c_bit,
+            0,
+            path_len,
+        )
     }
 
     fn hash_non_leaf_layer(
@@ -205,6 +199,7 @@ impl MerkleChip {
         path_elem: Fp,
         c_bit: Fp,
         layer: usize,
+        path_len: usize,
     ) -> Result<Alloc, Error> {
         self.hash_layer_inner(
             layouter,
@@ -212,6 +207,7 @@ impl MerkleChip {
             path_elem,
             c_bit,
             layer,
+            path_len,
         )
     }
 
@@ -222,6 +218,7 @@ impl MerkleChip {
         path_elem: Fp,
         c_bit: Fp,
         layer: usize,
+        path_len: usize,
     ) -> Result<Alloc, Error> {
         let mut digest_alloc: Option<Alloc> = None;
 
@@ -322,7 +319,7 @@ impl MerkleChip {
                 self.config.s_hash.enable(&mut region, row_offset)?;
 
                 // If the calculated digest is the tree's root, expose it as a public input.
-                let digest_is_root = layer == PATH_LEN - 1;
+                let digest_is_root = layer == path_len - 1;
                 if digest_is_root {
                     self.config.s_pub.enable(&mut region, row_offset)?;
                 }
@@ -358,20 +355,23 @@ impl Circuit<Fp> for MerkleCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<Fp>,
     ) -> Result<(), Error> {
+        let path_len = self.path.as_ref().unwrap().len();
         let merkle_chip = MerkleChip::new(config);
         let mut layer_digest = merkle_chip.hash_leaf_layer(
             &mut layouter,
-            self.leaf.as_ref().unwrap().clone(),
+            *self.leaf.as_ref().unwrap(),
             self.path.as_ref().unwrap()[0],
-            self.c_bits.as_ref().unwrap()[0].clone(),
+            self.c_bits.as_ref().unwrap()[0],
+            path_len,
         )?;
-        for layer in 1..PATH_LEN {
+        for layer in 1..path_len {
             layer_digest = merkle_chip.hash_non_leaf_layer(
                 &mut layouter,
                 layer_digest,
-                self.path.as_ref().unwrap()[layer].clone(),
-                self.c_bits.as_ref().unwrap()[layer].clone(),
+                self.path.as_ref().unwrap()[layer],
+                self.c_bits.as_ref().unwrap()[layer],
                 layer,
+                path_len,
             )?;
         }
         Ok(())
@@ -386,114 +386,122 @@ impl Circuit<Fp> for MerkleCircuit {
     }
 }
 
-struct Tree(Vec<Vec<Fp>>);
+#[cfg(test)]
+mod tests {
+    use super::{mock_hash, MerkleCircuit};
+    use halo2_proofs::dev::{FailureLocation, VerifyFailure};
+    use halo2_proofs::pasta::Fp;
+    use halo2_proofs::plonk::Any;
+    use halo2_proofs::{arithmetic::Field, dev::MockProver};
+    use rand::{thread_rng, Rng};
 
-impl Tree {
-    fn rand() -> Self {
-        let mut rng = thread_rng();
-        let leafs: Vec<Fp> = (0..N_LEAFS).map(|_| Fp::random(&mut rng)).collect();
-        let mut layers = vec![leafs];
-        for l in 1..TREE_LAYERS {
-            let layer: Vec<Fp> = layers[l - 1]
-                .chunks(2)
-                .map(|pair| mock_hash(pair[0], pair[1]))
-                .collect();
-            layers.push(layer)
+    struct Tree(Vec<Vec<Fp>>);
+
+    impl Tree {
+        fn rand(n_leaves: usize, tree_layers: usize) -> Self {
+            let mut rng = thread_rng();
+            let leafs: Vec<Fp> = (0..n_leaves).map(|_| Fp::random(&mut rng)).collect();
+            let mut layers = vec![leafs];
+            for l in 1..tree_layers {
+                let layer: Vec<Fp> = layers[l - 1]
+                    .chunks(2)
+                    .map(|pair| mock_hash(pair[0], pair[1]))
+                    .collect();
+                layers.push(layer)
+            }
+            assert_eq!(layers.last().unwrap().len(), 1);
+            Tree(layers)
         }
-        assert_eq!(layers.last().unwrap().len(), 1);
-        Tree(layers)
-    }
 
-    fn root(&self) -> Fp {
-        self.0.last().unwrap()[0]
-    }
-
-    fn leafs(&self) -> &[Fp] {
-        self.0.first().unwrap()
-    }
-
-    fn gen_path(&self, c: usize) -> Vec<Fp> {
-        let mut path = vec![];
-        let mut node_index = c;
-        for layer in 0..PATH_LEN {
-            let sib = if node_index & 1 == 0 {
-                self.0[layer][node_index + 1].clone()
-            } else {
-                self.0[layer][node_index - 1].clone()
-            };
-            path.push(sib);
-            node_index /= 2;
+        fn root(&self) -> Fp {
+            self.0.last().unwrap()[0]
         }
-        path
-    }
 
-    fn calculateRoot(leaf: Fp, path: Vec<Fp>, c_bits: Vec<Fp>) -> Fp {
-        path.iter()
-            .zip(c_bits.iter().map(|x| *x == Fp::one()))
-            .fold(leaf, |a, b| {
-                if b.1 {
-                    mock_hash(a, *b.0)
+        fn leafs(&self) -> &[Fp] {
+            self.0.first().unwrap()
+        }
+
+        fn gen_path(&self, c: usize, path_len: usize) -> Vec<Fp> {
+            let mut path = vec![];
+            let mut node_index = c;
+            for layer in 0..path_len {
+                let sib = if node_index & 1 == 0 {
+                    self.0[layer][node_index + 1].clone()
                 } else {
-                    mock_hash(*b.0, a)
-                }
-            })
+                    self.0[layer][node_index - 1].clone()
+                };
+                path.push(sib);
+                node_index /= 2;
+            }
+            path
+        }
+
+        fn calculate_root(leaf: Fp, path: Vec<Fp>, c_bits: Vec<Fp>) -> Fp {
+            path.iter()
+                .zip(c_bits.iter().map(|x| *x == Fp::one()))
+                .fold(leaf, |a, b| {
+                    if b.1 {
+                        mock_hash(a, *b.0)
+                    } else {
+                        mock_hash(*b.0, a)
+                    }
+                })
+        }
     }
-}
 
-fn main() {
-    assert!(N_LEAFS.is_power_of_two());
-
-    // Generate a Merkle tree from random data.
-    let tree = Tree::rand();
-
-    // Generate a random challenge, i.e. a leaf index in `[0, N_LEAFS)`.
-    let c: usize = thread_rng().gen_range(0..N_LEAFS);
-    let c_bits: Vec<Fp> = (0..PATH_LEN).map(|i| Fp::from((c >> i & 1) == 0)).collect();
-
-    // Create the public inputs. Every other row in the constraint system has a public input for a
-    // challenge bit, additionally the last row has a public input for the root.
-    let k = (N_ROWS_USED as f32).log2().ceil() as u32;
-    let mut pub_inputs = vec![tree.root(); 2 * PATH_LEN + 1];
-    for i in 0..PATH_LEN {
-        pub_inputs[2 * i] = c_bits[i];
+    struct TestSetup {
+        k: u32,
+        circuit: MerkleCircuit,
+        pub_inputs: Vec<Fp>,
+        last_row: usize,
+        tree: Tree,
+        c: usize,
+        c_bits: Vec<Fp>,
     }
-    pub_inputs[LAST_ROW] = tree.root();
 
-    // Assert that the constraint system is satisfied for a witness corresponding to `pub_inputs`.
-    let circuit = MerkleCircuit {
-        leaf: Some(tree.leafs()[c]),
-        path: Some(tree.gen_path(c)),
-        c_bits: Some(c_bits.clone()),
-    };
-    let prover = MockProver::run(k, &circuit, vec![pub_inputs.clone()]).unwrap();
-    assert!(prover.verify().is_ok());
+    fn setup_test() -> TestSetup {
+        // The number of leafs in the Merkle tree. This value can be changed to any power of two.
+        let n_leaves: usize = 512;
+        let path_len: usize = n_leaves.trailing_zeros() as usize;
+        let tree_layers = path_len + 1;
 
-    // Assert that changing the public challenge causes the constraint system to become unsatisfied.
-    let mut bad_pub_inputs = pub_inputs.clone();
-    let instance_value = pub_inputs[0] == Fp::zero();
-    bad_pub_inputs[0] = Fp::from(instance_value);
+        // The number of rows used in the constraint system matrix (two rows per path element).
+        let n_rows_used = 2 * path_len;
+        let last_row = n_rows_used - 1;
+        assert!(n_leaves.is_power_of_two());
 
-    let prover = MockProver::run(k, &circuit, vec![bad_pub_inputs]).unwrap();
-    assert_eq!(
-        prover.verify(),
-        Err(vec![VerifyFailure::ConstraintNotSatisfied {
-            constraint: ((0, "public input").into(), 0, "").into(),
-            location: FailureLocation::InRegion {
-                region: (0, "leaf layer").into(),
-                offset: 0,
-            },
-            cell_values: vec![
-                (
-                    ((Any::Instance, 0).into(), 0).into(),
-                    (instance_value as u64).to_string()
-                ),
-                (
-                    ((Any::Advice, 2).into(), 0).into(),
-                    (!instance_value as u64).to_string()
-                ),
-            ],
-        }])
-    );
+        // Generate a Merkle tree from random data.
+        let tree = Tree::rand(n_leaves, tree_layers);
+
+        // Generate a random challenge, i.e. a leaf index in `[0, n_leaves)`.
+        let c: usize = thread_rng().gen_range(0..n_leaves);
+        let c_bits: Vec<Fp> = (0..path_len).map(|i| Fp::from((c >> i & 1) == 0)).collect();
+
+        // Create the public inputs. Every other row in the constraint system has a public input for a
+        // challenge bit, additionally the last row has a public input for the root.
+        let k = (n_rows_used as f32).log2().ceil() as u32;
+        let mut pub_inputs = vec![tree.root(); 2 * path_len + 1];
+        for i in 0..path_len {
+            pub_inputs[2 * i] = c_bits[i];
+        }
+        pub_inputs[last_row] = tree.root();
+
+        // Assert that the constraint system is satisfied for a witness corresponding to `pub_inputs`.
+        let circuit = MerkleCircuit {
+            leaf: Some(tree.leafs()[c]),
+            path: Some(tree.gen_path(c, path_len)),
+            c_bits: Some(c_bits.clone()),
+        };
+        TestSetup {
+            k,
+            circuit,
+            pub_inputs,
+            last_row,
+            tree,
+            c,
+            c_bits,
+        }
+    }
 
     // Yucky little method to avoid intermittent test failure - the prover truncates leading 0s but Fp's debug method does not, leading to inconsistencies
     // TODO: find how the prover is truncating the leading 0s - it's surely more elegant than this
@@ -508,96 +516,146 @@ fn main() {
         s
     }
 
-    // Assert that changing the public root causes the constraint system to become unsatisfied.
-    let mut bad_pub_inputs = pub_inputs.clone();
-    bad_pub_inputs[LAST_ROW] += Fp::one();
-    let last_value = bad_pub_inputs[LAST_ROW];
-    let prover = MockProver::run(k, &circuit, vec![bad_pub_inputs]).unwrap();
-    assert_eq!(
-        prover.verify(),
-        Err(vec![VerifyFailure::ConstraintNotSatisfied {
-            constraint: ((0, "public input").into(), 0, "").into(),
-            location: FailureLocation::InRegion {
-                region: (8, "leaf layer").into(),
-                offset: 1,
-            },
-            cell_values: vec![
-                (((Any::Instance, 0).into(), 0).into(), format_fp(last_value),),
-                (
-                    ((Any::Advice, 2).into(), 0).into(),
-                    format_fp(pub_inputs[LAST_ROW]),
-                ),
-            ],
-        }])
-    );
+    #[test]
+    fn basic_test_works() {
+        let s = setup_test();
+        let prover = MockProver::run(s.k, &s.circuit, vec![s.pub_inputs.clone()]).unwrap();
+        assert!(prover.verify().is_ok());
+    }
 
-    // Assert that a non-boolean challenge bit causes the boolean constrain and swap gates to fail.
-    let mut bad_pub_inputs = pub_inputs.clone();
-    bad_pub_inputs[0] = Fp::from(2);
-    let mut bad_circuit = circuit.clone();
-    bad_circuit.c_bits.as_mut().unwrap()[0] = Fp::from(2);
-    let prover = MockProver::run(k, &bad_circuit, vec![bad_pub_inputs]).unwrap();
+    #[test]
+    fn changing_challenge_fails() {
+        let s = setup_test();
+        let instance_value = s.pub_inputs[0] == Fp::zero();
+        let mut bad_pub_inputs = s.pub_inputs;
+        bad_pub_inputs[0] = Fp::from(instance_value);
 
-    let (first, second) = if c & 1 == 0 {
-        (tree.0[0][c], tree.0[0][c + 1])
-    } else {
-        (tree.0[0][c], tree.0[0][c - 1])
-    };
-
-    assert_eq!(
-        prover.verify(),
-        Err(vec![
-            VerifyFailure::ConstraintNotSatisfied {
-                constraint: ((1, "boolean constrain").into(), 0, "").into(),
-                location: FailureLocation::InRegion {
-                    region: (0, "leaf layer").into(),
-                    offset: 0,
-                },
-                cell_values: vec![(((Any::Advice, 2).into(), 0).into(), "0x2".to_string())],
-            },
-            VerifyFailure::ConstraintNotSatisfied {
-                constraint: ((2, "swap").into(), 0, "").into(),
+        let prover = MockProver::run(s.k, &s.circuit, vec![bad_pub_inputs]).unwrap();
+        assert_eq!(
+            prover.verify(),
+            Err(vec![VerifyFailure::ConstraintNotSatisfied {
+                constraint: ((0, "public input").into(), 0, "").into(),
                 location: FailureLocation::InRegion {
                     region: (0, "leaf layer").into(),
                     offset: 0,
                 },
                 cell_values: vec![
-                    (((Any::Advice, 0).into(), 0).into(), format_fp(first),),
-                    (((Any::Advice, 0).into(), 1).into(), format_fp(second),),
-                    (((Any::Advice, 1).into(), 0).into(), format_fp(second),),
-                    (((Any::Advice, 1).into(), 1).into(), format_fp(first)),
-                    (((Any::Advice, 2).into(), 0).into(), "0x2".to_string(),),
+                    (
+                        ((Any::Instance, 0).into(), 0).into(),
+                        (instance_value as u64).to_string()
+                    ),
+                    (
+                        ((Any::Advice, 2).into(), 0).into(),
+                        (!instance_value as u64).to_string()
+                    ),
                 ],
-            }
-        ])
-    );
+            }])
+        );
+    }
 
-    // Assert that changing the witnessed path causes the constraint system to become unsatisfied
-    // when checking that the calculated root is equal to the public input root.
-    let mut bad_circuit = circuit;
-    bad_circuit.path.as_mut().unwrap()[0] += Fp::one();
-    let bad_root = Tree::calculateRoot(
-        bad_circuit.clone().leaf.unwrap(),
-        bad_circuit.clone().path.unwrap(),
-        c_bits,
-    );
+    #[test]
+    fn changing_root_fails() {
+        let s = setup_test();
 
-    let prover = MockProver::run(k, &bad_circuit, vec![pub_inputs.clone()]).unwrap();
-    assert_eq!(
-        prover.verify(),
-        Err(vec![VerifyFailure::ConstraintNotSatisfied {
-            constraint: ((0, "public input").into(), 0, "").into(),
-            location: FailureLocation::InRegion {
-                region: (8, "leaf layer").into(),
-                offset: 1,
-            },
-            cell_values: vec![
-                (
-                    ((Any::Instance, 0).into(), 0).into(),
-                    format_fp(pub_inputs[LAST_ROW])
-                ),
-                (((Any::Advice, 2).into(), 0).into(), format_fp(bad_root),),
-            ],
-        }])
-    );
+        // Assert that changing the public root causes the constraint system to become unsatisfied.
+        let mut bad_pub_inputs = s.pub_inputs.clone();
+        bad_pub_inputs[s.last_row] += Fp::one();
+        let last_value = bad_pub_inputs[s.last_row];
+        let prover = MockProver::run(s.k, &s.circuit, vec![bad_pub_inputs]).unwrap();
+        assert_eq!(
+            prover.verify(),
+            Err(vec![VerifyFailure::ConstraintNotSatisfied {
+                constraint: ((0, "public input").into(), 0, "").into(),
+                location: FailureLocation::InRegion {
+                    region: (8, "leaf layer").into(),
+                    offset: 1,
+                },
+                cell_values: vec![
+                    (((Any::Instance, 0).into(), 0).into(), format_fp(last_value),),
+                    (
+                        ((Any::Advice, 2).into(), 0).into(),
+                        format_fp(s.pub_inputs[s.last_row]),
+                    ),
+                ],
+            }])
+        );
+    }
+
+    #[test]
+    fn non_boolean_challenge_fails() {
+        let s = setup_test();
+        // Assert that a non-boolean challenge bit causes the boolean constrain and swap gates to fail.
+        let mut bad_pub_inputs = s.pub_inputs.clone();
+        bad_pub_inputs[0] = Fp::from(2);
+        let mut bad_circuit = s.circuit.clone();
+        bad_circuit.c_bits.as_mut().unwrap()[0] = Fp::from(2);
+        let prover = MockProver::run(s.k, &bad_circuit, vec![bad_pub_inputs]).unwrap();
+
+        let (first, second) = if s.c & 1 == 0 {
+            (s.tree.0[0][s.c], s.tree.0[0][s.c + 1])
+        } else {
+            (s.tree.0[0][s.c], s.tree.0[0][s.c - 1])
+        };
+
+        assert_eq!(
+            prover.verify(),
+            Err(vec![
+                VerifyFailure::ConstraintNotSatisfied {
+                    constraint: ((1, "boolean constrain").into(), 0, "").into(),
+                    location: FailureLocation::InRegion {
+                        region: (0, "leaf layer").into(),
+                        offset: 0,
+                    },
+                    cell_values: vec![(((Any::Advice, 2).into(), 0).into(), "0x2".to_string())],
+                },
+                VerifyFailure::ConstraintNotSatisfied {
+                    constraint: ((2, "swap").into(), 0, "").into(),
+                    location: FailureLocation::InRegion {
+                        region: (0, "leaf layer").into(),
+                        offset: 0,
+                    },
+                    cell_values: vec![
+                        (((Any::Advice, 0).into(), 0).into(), format_fp(first),),
+                        (((Any::Advice, 0).into(), 1).into(), format_fp(second),),
+                        (((Any::Advice, 1).into(), 0).into(), format_fp(second),),
+                        (((Any::Advice, 1).into(), 1).into(), format_fp(first)),
+                        (((Any::Advice, 2).into(), 0).into(), "0x2".to_string(),),
+                    ],
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn changing_path_fails() {
+        let s = setup_test();
+        // Assert that changing the witnessed path causes the constraint system to become unsatisfied
+        // when checking that the calculated root is equal to the public input root.
+        let mut bad_circuit = s.circuit;
+        bad_circuit.path.as_mut().unwrap()[0] += Fp::one();
+        let bad_root = Tree::calculate_root(
+            bad_circuit.clone().leaf.unwrap(),
+            bad_circuit.clone().path.unwrap(),
+            s.c_bits,
+        );
+
+        let prover = MockProver::run(s.k, &bad_circuit, vec![s.pub_inputs.clone()]).unwrap();
+        assert_eq!(
+            prover.verify(),
+            Err(vec![VerifyFailure::ConstraintNotSatisfied {
+                constraint: ((0, "public input").into(), 0, "").into(),
+                location: FailureLocation::InRegion {
+                    region: (8, "leaf layer").into(),
+                    offset: 1,
+                },
+                cell_values: vec![
+                    (
+                        ((Any::Instance, 0).into(), 0).into(),
+                        format_fp(s.pub_inputs[s.last_row])
+                    ),
+                    (((Any::Advice, 2).into(), 0).into(), format_fp(bad_root),),
+                ],
+            }])
+        );
+    }
 }
