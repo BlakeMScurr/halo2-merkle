@@ -195,8 +195,6 @@ impl MerkleChip {
         layer: usize,
         path_len: usize,
     ) -> Result<LayerDigest, Error> {
-        let mut digest_alloc: Option<LayerDigest> = None;
-
         layouter.assign_region(
             || "leaf layer",
             |mut region| {
@@ -284,11 +282,6 @@ impl MerkleChip {
                     || Value::known(digest_value),
                 )?;
 
-                digest_alloc = Some(LayerDigest {
-                    cell: digest_cell.cell(),
-                    value: digest_value,
-                });
-
                 self.config.s_hash.enable(&mut region, row_offset)?;
 
                 // If the calculated digest is the tree's root, expose it as a public input.
@@ -297,14 +290,12 @@ impl MerkleChip {
                     self.config.s_pub.enable(&mut region, row_offset)?;
                 }
 
-                Ok(())
+                Ok(LayerDigest {
+                    cell: digest_cell.cell(),
+                    value: digest_value,
+                })
             },
-        )?;
-
-        match digest_alloc {
-            None => Err(Error::Synthesis),
-            Some(inner) => Ok(inner),
-        }
+        )
     }
 }
 
