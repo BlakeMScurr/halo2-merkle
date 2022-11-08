@@ -34,30 +34,9 @@ fn mock_hash(a: Fp, b: Fp) -> Fp {
     (a + *GAMMA) * (b + *GAMMA)
 }
 
-struct Alloc {
+struct LayerDigest {
     cell: Cell,
     value: Fp,
-}
-
-enum MaybeAlloc {
-    Alloc(Alloc),
-    Unalloc(Fp),
-}
-
-impl MaybeAlloc {
-    fn value(&self) -> Fp {
-        match self {
-            MaybeAlloc::Alloc(alloc) => alloc.value,
-            MaybeAlloc::Unalloc(value) => *value,
-        }
-    }
-
-    fn cell(&self) -> Cell {
-        match self {
-            MaybeAlloc::Alloc(alloc) => alloc.cell,
-            MaybeAlloc::Unalloc(_) => unreachable!(),
-        }
-    }
 }
 
 struct MerkleChip {
@@ -181,29 +160,24 @@ impl MerkleChip {
         path_elem: Fp,
         c_bit: Fp,
         path_len: usize,
-    ) -> Result<Alloc, Error> {
-        self.hash_layer_inner(
-            layouter,
-            MaybeAlloc::Unalloc(leaf),
-            path_elem,
-            c_bit,
-            0,
-            path_len,
-        )
+    ) -> Result<LayerDigest, Error> {
+        self.hash_layer_inner(layouter, leaf, None, path_elem, c_bit, 0, path_len)
     }
 
     fn hash_non_leaf_layer(
         &self,
         layouter: &mut impl Layouter<Fp>,
-        prev_digest: Alloc,
+        prev_digest: Fp,
+        prev_digest_cell: Cell,
         path_elem: Fp,
         c_bit: Fp,
         layer: usize,
         path_len: usize,
-    ) -> Result<Alloc, Error> {
+    ) -> Result<LayerDigest, Error> {
         self.hash_layer_inner(
             layouter,
-            MaybeAlloc::Alloc(prev_digest),
+            prev_digest,
+            Some(prev_digest_cell),
             path_elem,
             c_bit,
             layer,
@@ -214,13 +188,14 @@ impl MerkleChip {
     fn hash_layer_inner(
         &self,
         layouter: &mut impl Layouter<Fp>,
-        leaf_or_digest: MaybeAlloc,
+        a_value: Fp,
+        prev_digest_cell: Option<Cell>,
         path_elem: Fp,
         c_bit: Fp,
         layer: usize,
         path_len: usize,
-    ) -> Result<Alloc, Error> {
-        let mut digest_alloc: Option<Alloc> = None;
+    ) -> Result<LayerDigest, Error> {
+        let mut digest_alloc: Option<LayerDigest> = None;
 
         layouter.assign_region(
             || "leaf layer",
@@ -229,7 +204,6 @@ impl MerkleChip {
 
                 // Allocate in `a_col` either the leaf or reallocate the previous tree layer's
                 // calculated digest (stored in the previous row's `c_col`).
-                let a_value = leaf_or_digest.value();
 
                 let a_cell = region
                     .assign_advice(
@@ -247,8 +221,7 @@ impl MerkleChip {
                     .cell();
 
                 if layer > 0 {
-                    let prev_digest_cell = leaf_or_digest.cell();
-                    region.constrain_equal(prev_digest_cell, a_cell)?;
+                    region.constrain_equal(prev_digest_cell.unwrap(), a_cell)?;
                 }
 
                 // Allocate private inputs for this tree layer's path element and challenge bit (in
@@ -311,7 +284,7 @@ impl MerkleChip {
                     || Value::known(digest_value),
                 )?;
 
-                digest_alloc = Some(Alloc {
+                digest_alloc = Some(LayerDigest {
                     cell: digest_cell.cell(),
                     value: digest_value,
                 });
@@ -370,7 +343,8 @@ impl Circuit<Fp> for MerkleCircuit {
         for layer in 1..path_len {
             layer_digest = merkle_chip.hash_non_leaf_layer(
                 &mut layouter,
-                layer_digest,
+                layer_digest.value,
+                layer_digest.cell,
                 self.path[layer],
                 self.c_bits[layer],
                 layer,
