@@ -426,6 +426,18 @@ impl Tree {
         }
         path
     }
+
+    fn calculateRoot(leaf: Fp, path: Vec<Fp>, c_bits: Vec<Fp>) -> Fp {
+        path.iter()
+            .zip(c_bits.iter().map(|x| *x == Fp::one()))
+            .fold(leaf, |a, b| {
+                if b.1 {
+                    mock_hash(a, *b.0)
+                } else {
+                    mock_hash(*b.0, a)
+                }
+            })
+    }
 }
 
 fn main() {
@@ -562,43 +574,29 @@ fn main() {
 
     // Assert that changing the witnessed path causes the constraint system to become unsatisfied
     // when checking that the calculated root is equal to the public input root.
-    let mut bad_circuit = circuit.clone();
+    let mut bad_circuit = circuit;
     bad_circuit.path.as_mut().unwrap()[0] += Fp::one();
-    println!("{:?}", tree.root());
-    let mut p = tree.gen_path(c);
-    p[0] += Fp::one();
-    let broken_hash = p
-        .iter()
-        .zip(c_bits.iter().map(|x| *x == Fp::one()))
-        .skip(1)
-        .fold(p[0], |a, b| {
-            if b.1 {
-                mock_hash(a, *b.0)
-            } else {
-                mock_hash(*b.0, a)
-            }
-        });
-    println!("{:?}", broken_hash);
+    let bad_root = Tree::calculateRoot(
+        bad_circuit.clone().leaf.unwrap(),
+        bad_circuit.clone().path.unwrap(),
+        c_bits,
+    );
 
     let prover = MockProver::run(k, &bad_circuit, vec![pub_inputs.clone()]).unwrap();
-    // println!("{:?}", prover);
     assert_eq!(
         prover.verify(),
         Err(vec![VerifyFailure::ConstraintNotSatisfied {
             constraint: ((0, "public input").into(), 0, "").into(),
             location: FailureLocation::InRegion {
                 region: (8, "leaf layer").into(),
-                offset: 0,
+                offset: 1,
             },
             cell_values: vec![
                 (
                     ((Any::Instance, 0).into(), 0).into(),
-                    (instance_value as u64).to_string()
+                    format_fp(pub_inputs[LAST_ROW])
                 ),
-                (
-                    ((Any::Advice, 2).into(), 0).into(),
-                    (!instance_value as u64).to_string()
-                ),
+                (((Any::Advice, 2).into(), 0).into(), format_fp(bad_root),),
             ],
         }])
     );
